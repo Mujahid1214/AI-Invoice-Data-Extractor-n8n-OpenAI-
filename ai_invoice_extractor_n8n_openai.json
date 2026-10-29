@@ -1,0 +1,304 @@
+{
+  "name": "Day 2 - AI Invoice Data Extractor (n8n + OpenAI)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "AI Invoice Extractor",
+        "formDescription": "Upload a PDF invoice. AI will extract the vendor, date and amount and save it to Google Sheets automatically.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Invoice PDF",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "buttonLabel": "Extract Invoice Data",
+          "appendAttribution": false,
+          "respondWithOptions": {
+            "values": {
+              "formSubmittedText": "Done! Your invoice was processed and added to the sheet."
+            }
+          }
+        }
+      },
+      "id": "28d78122-ea77-51a2-99be-4e3ba469f46b",
+      "name": "Upload Invoice (Form)",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "d34f7971-c7a7-586c-9e92-4a6fc1517442"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Convert the uploaded PDF to base64 and build the OpenAI request body\nconst item = $input.first();\nconst keys = Object.keys(item.binary || {});\nif (!keys.length) {\n  throw new Error('No PDF was uploaded. Please upload an invoice in PDF format.');\n}\n\nconst binaryKey = keys[0];\nconst file = item.binary[binaryKey];\nconst buffer = await this.helpers.getBinaryDataBuffer(0, binaryKey);\nconst base64 = buffer.toString('base64');\nconst fileName = file.fileName || 'invoice.pdf';\n\nconst prompt = [\n  'You are an accounting assistant that reads invoices.',\n  'Extract the following fields from the attached invoice PDF:',\n  '- vendor: the name of the company that issued the invoice',\n  '- invoice_number: the invoice number or ID (empty string if not found)',\n  '- invoice_date: the invoice issue date in YYYY-MM-DD format (empty string if not found)',\n  '- currency: the 3-letter currency code, for example USD, PKR, EUR (empty string if not found)',\n  '- total_amount: the final total amount due as a plain number, with no currency symbol or thousands separators (null if not found)',\n  'Never guess or invent values.'\n].join('\\n');\n\nreturn [{\n  json: {\n    fileName,\n    requestBody: {\n      model: 'gpt-4o-mini',\n      temperature: 0,\n      messages: [{\n        role: 'user',\n        content: [\n          { type: 'text', text: prompt },\n          {\n            type: 'file',\n            file: {\n              filename: fileName,\n              file_data: 'data:application/pdf;base64,' + base64\n            }\n          }\n        ]\n      }],\n      response_format: {\n        type: 'json_schema',\n        json_schema: {\n          name: 'invoice_extraction',\n          strict: true,\n          schema: {\n            type: 'object',\n            properties: {\n              vendor: { type: 'string' },\n              invoice_number: { type: 'string' },\n              invoice_date: { type: 'string' },\n              currency: { type: 'string' },\n              total_amount: { type: ['number', 'null'] }\n            },\n            required: ['vendor', 'invoice_number', 'invoice_date', 'currency', 'total_amount'],\n            additionalProperties: false\n          }\n        }\n      }\n    }\n  }\n}];\n"
+      },
+      "id": "1ad77c9f-4991-50a6-b461-4922e47900b7",
+      "name": "Prepare PDF for OpenAI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "6f5ba77d-7162-5e36-a76a-05898f51f047",
+      "name": "OpenAI Extract Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read OpenAI's JSON answer and shape one clean row for Google Sheets\nconst res = $input.first().json;\nconst message = res?.choices?.[0]?.message;\n\nif (message?.refusal) {\n  throw new Error('OpenAI refused the request: ' + message.refusal);\n}\n\nconst text = message?.content;\nif (!text) {\n  throw new Error('OpenAI returned no content: ' + JSON.stringify(res).slice(0, 300));\n}\n\nlet data;\ntry {\n  data = JSON.parse(text);\n} catch (e) {\n  const match = text.match(/\\{[\\s\\S]*\\}/);\n  if (!match) throw new Error('Could not parse OpenAI output as JSON: ' + text.slice(0, 200));\n  data = JSON.parse(match[0]);\n}\n\nconst fileName = $('Prepare PDF for OpenAI').first().json.fileName;\n\nreturn [{\n  json: {\n    processed_at: new Date().toISOString(),\n    file_name: fileName,\n    vendor: (data.vendor ?? '').toString().trim(),\n    invoice_number: (data.invoice_number ?? '').toString().trim(),\n    invoice_date: (data.invoice_date ?? '').toString().trim(),\n    currency: (data.currency ?? '').toString().trim(),\n    total_amount: (data.total_amount === null || data.total_amount === undefined) ? '' : data.total_amount\n  }\n}];\n"
+      },
+      "id": "c94dc268-3ec5-5e81-9457-65d26147ef55",
+      "name": "Parse OpenAI JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8c4c01d9-ee0f-5187-ba88-12221746b96a",
+              "leftValue": "={{ $json.vendor }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "c6d2d3bf-eff6-5902-96e0-98565ddf3ae2",
+              "leftValue": "={{ $json.total_amount }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7347ad2a-3a98-53a8-9f39-ac7442c88169",
+      "name": "Vendor and Amount Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date Processed": "={{ $json.processed_at }}",
+            "File Name": "={{ $json.file_name }}",
+            "Vendor": "={{ $json.vendor }}",
+            "Invoice Number": "={{ $json.invoice_number }}",
+            "Invoice Date": "={{ $json.invoice_date }}",
+            "Currency": "={{ $json.currency }}",
+            "Total Amount": "={{ $json.total_amount }}"
+          },
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "55f803a0-fdf9-5e3f-adb2-8acf0bf5ca46",
+      "name": "Add Row to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1300,
+        200
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "errorMessage": "Could not find the vendor or total amount in this invoice. Please check the PDF and review it manually."
+      },
+      "id": "7906ab67-105b-572d-8ed1-66aa6cbc672b",
+      "name": "Stop: Needs Manual Review",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Day 2: AI Invoice Data Extractor (OpenAI)\n\n**Flow:** Upload PDF -> OpenAI reads it -> clean JSON -> row added to Google Sheets.\n\n**Setup (3 steps):**\n1. Open the *OpenAI Extract Data* node and select (or create) your **OpenAI API** credential.\n2. Connect your Google Sheets credential and paste your Sheet ID.\n3. In row 1 of the sheet, add these headers exactly: `Date Processed`, `File Name`, `Vendor`, `Invoice Number`, `Invoice Date`, `Currency`, `Total Amount`.\n\nThen click **Test workflow** and upload a PDF invoice.",
+        "height": 380,
+        "width": 520,
+        "color": 4
+      },
+      "id": "601edd11-2082-50a8-a937-7d53c1966c33",
+      "name": "Sticky Note: Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**Model:** `gpt-4o-mini` reads the PDF directly (text and page images) and returns structured JSON using a strict schema. For tougher or messy invoices, change `model` in the *Prepare PDF for OpenAI* code node to `gpt-4o` or `gpt-4.1`.\n\nTip: `temperature: 0` keeps the extraction consistent.",
+        "height": 240,
+        "width": 360,
+        "color": 6
+      },
+      "id": "118ccb12-0e94-57ef-82ca-7bd307528cd3",
+      "name": "Sticky Note: OpenAI",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        480,
+        460
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Upload Invoice (Form)": {
+      "main": [
+        [
+          {
+            "node": "Prepare PDF for OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare PDF for OpenAI": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Extract Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Extract Data": {
+      "main": [
+        [
+          {
+            "node": "Parse OpenAI JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse OpenAI JSON": {
+      "main": [
+        [
+          {
+            "node": "Vendor and Amount Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vendor and Amount Found?": {
+      "main": [
+        [
+          {
+            "node": "Add Row to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop: Needs Manual Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "19e947d9-3c51-5bb2-bf1a-945494b88580",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "a300f6d9-5ab4-50cc-a6dd-7fd288c264df",
+  "tags": []
+}
